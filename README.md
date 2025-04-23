@@ -36,6 +36,47 @@ Aeon AI is a sophisticated implementation of Proximal Policy Optimization (PPO) 
   - Intrinsic motivation through curiosity
   - Expert demonstration learning
 
+- **GPU Optimization**
+  - Mixed precision training (FP16/BF16)
+  - Multi-GPU support via DataParallel
+  - Memory-efficient gradient accumulation
+  - Dynamic VRAM allocation
+
+- **Command-Line Interface**
+  - Easy experimentation with `agent.py`
+  - Checkpoint management and resuming
+  - Comprehensive logging and visualization
+  - Configuration via CLI flags or JSON
+
+## Command-Line Interface
+
+Aeon includes a powerful CLI for training and evaluation:
+
+```bash
+# Basic training
+python agent.py --env HalfCheetah-v4 --timesteps 1000000
+
+# GPU optimization for RTX 3090
+python agent.py --env Humanoid-v4 --batch-size 4096 --micro-batch 512 \
+                --mixed-precision --memory-fraction 0.85
+
+# Multi-GPU training
+python agent.py --env Ant-v4 --multi-gpu --batch-size 8192
+
+# Resume from checkpoint
+python agent.py --env Hopper-v4 --resume ./results/Hopper-v4-20230601/checkpoint_500000.pt
+
+# Evaluation only
+python agent.py --env Walker2d-v4 --resume ./results/Walker2d-v4/best_model.pt \
+                --eval-only --eval-episodes 20 --render
+```
+
+For a complete list of options:
+
+```bash
+python agent.py --help
+```
+
 ## Architecture
 
 ### AdaptiveActorCritic
@@ -58,9 +99,11 @@ The main algorithm class that implements:
 
 ## Usage
 
+### Python API
+
 ```python
 import gym
-from manning_ai import AdvancedPPO
+from aeon import AdvancedPPO
 
 # Create environment
 env = gym.make('HalfCheetah-v4')
@@ -76,7 +119,14 @@ config = {
     'batch_size': 512,
     'epochs': 15,
     'lr': 3e-4,
-    'wd': 1e-6
+    'wd': 1e-6,
+    
+    # GPU configuration (for RTX GPUs)
+    'gpu_config': {
+        'cuda_device': 0,  # or [0,1,2,3] for multi-GPU
+        'memory_fraction': 0.9,
+        'mixed_precision': True
+    }
 }
 
 # Create agent
@@ -93,10 +143,10 @@ print(f"Final average reward: {results['final_avg_reward']}")
 
 ### Hyperparameter Auto-Tuning
 
-Manning AI includes an evolutionary optimization approach for finding optimal hyperparameters:
+Aeon includes an evolutionary optimization approach for finding optimal hyperparameters:
 
 ```python
-from aeon_ai import AutoTuner
+from aeon import AutoTuner
 
 # Define tuning configuration
 auto_tune_config = {
@@ -128,7 +178,7 @@ optimized_ppo = AdvancedPPO(env, best_config)
 Enhancing exploration with curiosity-driven learning:
 
 ```python
-from aeon_ai import AdvancedPPO, CuriosityModule
+from aeon import AdvancedPPO, CuriosityModule
 
 # Create environment and agent
 env = gym.make('SparseRewardEnvironment-v0')
@@ -173,7 +223,7 @@ while not done:
 Accelerating learning with expert demonstrations:
 
 ```python
-from aeon_ai import AdvancedPPO, DemonstrationBuffer
+from aeon import AdvancedPPO, DemonstrationBuffer
 
 # Create environment and agent
 env = gym.make('ComplexTask-v0')
@@ -233,6 +283,34 @@ A dataset implementation that allows prioritized sampling of experiences:
 dataset = ExperienceDataset(obs, acts, advantages, returns, values, log_probs)
 ```
 
+## GPU Optimization
+
+Aeon is specifically optimized for NVIDIA RTX GPUs:
+
+### Mixed Precision Training
+
+```python
+'gpu_config': {
+    'mixed_precision': True  # Enables FP16 calculations
+}
+```
+
+### Memory Management
+
+```python
+'gpu_config': {
+    'memory_fraction': 0.9  # Controls VRAM usage
+}
+```
+
+### Multi-GPU Support
+
+```python
+'gpu_config': {
+    'cuda_device': [0, 1, 2, 3]  # Uses all available GPUs
+}
+```
+
 ## Implementation Details
 
 ### State Normalization
@@ -276,10 +354,9 @@ if recent_success_rate > success_rate_threshold:
 - Consider environment vectorization for faster data collection
 - Monitor KL divergence to ensure stable updates
 - Balance intrinsic and extrinsic rewards for optimal exploration
--Layer-wise Adaptive Learning Rates - Implementing a custom optimizer that adjusts learning rates per layer based on     gradient statistics.
--Advanced Parallelization - Adding true vectorized environment support with shared memory for significantly faster data collection.
--Multi-GPU Training - Distributing the PPO training across multiple GPUs for very large models.
--Model Distillation - Implementing a technique to distill the trained policy into a smaller, faster model for deployment.
+- For RTX 3090, use batch sizes of 4096-8192 with gradient accumulation
+- Enable mixed precision training for 2-3x speedup
+- Monitor GPU utilization with `nvidia-smi -l 1`
 
 ## References
 
