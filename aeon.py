@@ -5,12 +5,101 @@ import numpy as np
 from torch.distributions import MultivariateNormal, Categorical
 from torch.utils.data import DataLoader, Dataset
 from collections import defaultdict
+import os
+import pickle
+from typing import Union, Dict, Any, Optional, Tuple, List, Callable
+from contextlib import nullcontext
 
+# Utility module for efficient implementation of advanced features
+class AeonUtils:
+    @staticmethod
+    def setup_device(cuda_device: Union[int, List[int]] = 0, 
+                    memory_fraction: float = 0.9,
+                    enable_mixed_precision: bool = True) -> Tuple[torch.device, Dict]:
+        """Configure CUDA devices with memory management and precision settings"""
+        if torch.cuda.is_available():
+            # Set visible devices if specified as list
+            if isinstance(cuda_device, list):
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, cuda_device))
+                device = torch.device("cuda:0")  # Use first in list as primary
+                multi_gpu = len(cuda_device) > 1
+            else:
+                device = torch.device(f"cuda:{cuda_device}")
+                multi_gpu = False
+            
+            # Memory management
+            for gpu_id in range(torch.cuda.device_count()):
+                torch.cuda.set_per_process_memory_fraction(memory_fraction, gpu_id)
+                # Reserve memory to avoid fragmentation
+                torch.cuda.empty_cache()
+                
+            # Precision settings
+            amp_settings = {
+                "enabled": enable_mixed_precision,
+                "dtype": torch.float16 if enable_mixed_precision else torch.float32,
+                "device_type": "cuda"
+            }
+        else:
+            device = torch.device("cpu")
+            multi_gpu = False
+            amp_settings = {"enabled": False}
+            
+        return device, {"multi_gpu": multi_gpu, "amp_settings": amp_settings}
+    
+    @staticmethod
+    def create_checkpoint(model: nn.Module, optimizer: optim.Optimizer, 
+                        stats: Dict, path: str, extra_data: Dict = None):
+        """Create unified checkpoint with model, optimizer and training state"""
+        checkpoint = {
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "stats": stats
+        }
+        if extra_data:
+            checkpoint.update(extra_data)
+            
+        torch.save(checkpoint, path)
+        
+    @staticmethod
+    def load_checkpoint(path: str, model: nn.Module = None, 
+                      optimizer: optim.Optimizer = None) -> Dict:
+        """Load checkpoint and restore model/optimizer states if provided"""
+        checkpoint = torch.load(path, map_location=lambda storage, loc: storage)
+        
+        if model is not None:
+            model.load_state_dict(checkpoint["model_state"])
+            
+        if optimizer is not None:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+            
+        return checkpoint
+    
+    @staticmethod
+    def get_action_distribution(action_type: str, params: Dict) -> torch.distributions.Distribution:
+        """Factory method to create appropriate action distribution"""
+        if action_type == "continuous":
+            return MultivariateNormal(params["mean"], torch.diag_embed(params["std"].pow(2)))
+        elif action_type == "discrete":
+            return Categorical(logits=params["logits"])
+        elif action_type == "mixed":
+            # For environments with both continuous and discrete actions
+            continuous_dist = MultivariateNormal(
+                params["mean"], torch.diag_embed(params["std"].pow(2))
+            )
+            discrete_dist = Categorical(logits=params["logits"])
+            return (continuous_dist, discrete_dist)
+        else:
+            raise ValueError(f"Unknown action type: {action_type}")
+
+
+# Modify AdaptiveActorCritic to support discrete actions
 class AdaptiveActorCritic(nn.Module):
     def __init__(self, obs_dim, act_dim, hidden_size=512, 
-                num_layers=3, activation='gelu'):
+                num_layers=3, activation='gelu', action_type='continuous',
+                discrete_dims=None):
         super().__init__()
         self.activation = getattr(nn, activation.upper())()
+        self.action_type = action_type
         
         # Shared trunk with layer norm
         self.shared_trunk = nn.ModuleList()
@@ -25,9 +114,21 @@ class AdaptiveActorCritic(nn.Module):
             nn.Sigmoid()
         )
         
-        # Policy head with learnable variance
-        self.actor = nn.Linear(hidden_size, act_dim)
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
+        # Policy head based on action type
+        if action_type == 'continuous':
+            self.actor = nn.Linear(hidden_size, act_dim)
+            self.log_std = nn.Parameter(torch.zeros(act_dim))
+        elif action_type == 'discrete':
+            self.actor = nn.Linear(hidden_size, act_dim)
+        elif action_type == 'mixed':
+            # For environments with both continuous and discrete parts
+            assert discrete_dims is not None, "Must specify discrete_dims for mixed action type"
+            continuous_dim = act_dim - sum(discrete_dims)
+            self.actor_continuous = nn.Linear(hidden_size, continuous_dim)
+            self.log_std = nn.Parameter(torch.zeros(continuous_dim))
+            self.actor_discrete = nn.ModuleList([
+                nn.Linear(hidden_size, dim) for dim in discrete_dims
+            ])
         
         # Value head with ensemble
         self.value_heads = nn.ModuleList(
@@ -48,22 +149,62 @@ class AdaptiveActorCritic(nn.Module):
         gate = self.gate(x)
         x = x * gate
         
-        # Policy
-        mean = self.actor(x)
-        std = torch.exp(self.log_std.clamp(-20, 2))
+        # Policy outputs based on action type
+        if self.action_type == 'continuous':
+            mean = self.actor(x)
+            std = torch.exp(self.log_std.clamp(-20, 2))
+            action_params = {"mean": mean, "std": std}
+        elif self.action_type == 'discrete':
+            logits = self.actor(x)
+            action_params = {"logits": logits}
+        elif self.action_type == 'mixed':
+            continuous_mean = self.actor_continuous(x)
+            std = torch.exp(self.log_std.clamp(-20, 2))
+            discrete_logits = [head(x) for head in self.actor_discrete]
+            action_params = {
+                "mean": continuous_mean, 
+                "std": std,
+                "logits": discrete_logits
+            }
         
         # Value ensemble
         values = [head(x) for head in self.value_heads]
         value = torch.stack(values).mean(0)
         value_std = torch.stack(values).std(0)
         
-        return mean, std, value, value_std
+        return action_params, value, value_std
 
+
+# Update initialization of AdvancedPPO to support efficient options
 class AdvancedPPO:
     def __init__(self, env, config):
         self.env = env
         self.obs_dim = env.observation_space.shape[0]
-        self.act_dim = env.action_space.shape[0]
+        
+        # Handle different action space types
+        self.action_type = config.get('action_type', 'continuous')
+        if self.action_type == 'continuous':
+            self.act_dim = env.action_space.shape[0]
+            self.discrete_dims = None
+        elif self.action_type == 'discrete':
+            self.act_dim = env.action_space.n
+            self.discrete_dims = None
+        elif self.action_type == 'mixed':
+            # For environments with MultiDiscrete or hybrid spaces
+            self.discrete_dims = config.get('discrete_dims', [])
+            continuous_dim = config.get('continuous_dim', 0)
+            self.act_dim = continuous_dim + sum(self.discrete_dims)
+        
+        # Setup device and precision options
+        gpu_config = config.get('gpu_config', {})
+        self.device, gpu_settings = AeonUtils.setup_device(
+            cuda_device=gpu_config.get('cuda_device', 0),
+            memory_fraction=gpu_config.get('memory_fraction', 0.9),
+            enable_mixed_precision=gpu_config.get('mixed_precision', True)
+        )
+        
+        self.multi_gpu = gpu_settings['multi_gpu']
+        self.amp_settings = gpu_settings['amp_settings']
         
         # Hyperparameters
         self.clip_range = config.get('clip_range', 0.2)
@@ -75,9 +216,25 @@ class AdvancedPPO:
         self.batch_size = config.get('batch_size', 512)
         self.epochs = config.get('epochs', 15)
         
-        # Networks
-        self.policy = AdaptiveActorCritic(self.obs_dim, self.act_dim)
-        self.old_policy = AdaptiveActorCritic(self.obs_dim, self.act_dim)
+        # Create networks
+        self.policy = AdaptiveActorCritic(
+            self.obs_dim, self.act_dim, 
+            action_type=self.action_type,
+            discrete_dims=self.discrete_dims
+        ).to(self.device)
+        
+        self.old_policy = AdaptiveActorCritic(
+            self.obs_dim, self.act_dim,
+            action_type=self.action_type, 
+            discrete_dims=self.discrete_dims
+        ).to(self.device)
+        
+        # Multi-GPU support if available
+        if self.multi_gpu:
+            # Create wrapped model for distributed computing
+            self.policy = nn.DataParallel(self.policy)
+            self.old_policy = nn.DataParallel(self.old_policy)
+            
         self.old_policy.load_state_dict(self.policy.state_dict())
         
         # Optimizer with lookahead
@@ -86,9 +243,15 @@ class AdvancedPPO:
                                    weight_decay=config.get('wd', 1e-6))
         self.lookahead = Lookahead(self.optimizer, k=5, alpha=0.5)
         
+        # Learning rate scheduler
+        self.lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='max', factor=0.5, patience=5,
+            verbose=True, min_lr=1e-5
+        ) if config.get('use_lr_scheduler', False) else None
+        
         # Normalization
-        self.obs_mean = torch.zeros(self.obs_dim)
-        self.obs_var = torch.ones(self.obs_dim)
+        self.obs_mean = torch.zeros(self.obs_dim).to(self.device)
+        self.obs_var = torch.ones(self.obs_dim).to(self.device)
         self.return_mean = 0.0
         self.return_var = 1.0
         
@@ -98,6 +261,22 @@ class AdvancedPPO:
             kl_target=0.01,
             rate=1.5
         )
+        
+        # Checkpointing
+        self.checkpoint_dir = config.get('checkpoint_dir', './checkpoints')
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
+        self.checkpoint_frequency = config.get('checkpoint_frequency', 20)
+        
+        # Stats tracking
+        self.training_stats = {
+            'rewards': [],
+            'episode_lengths': [],
+            'value_losses': [],
+            'policy_losses': [],
+            'entropies': [],
+            'kl_divs': [],
+            'learning_rates': []
+        }
     
     def adaptive_normalize(self, x, mean, var):
         return (x - mean) / torch.sqrt(var + 1e-8)
@@ -158,12 +337,12 @@ class AdvancedPPO:
         # - Prioritized experience replay
         
         # Unpack rollout data
-        states = torch.FloatTensor(rollout['states'])
-        actions = torch.FloatTensor(rollout['actions'])
-        rewards = torch.FloatTensor(rollout['rewards'])
-        dones = torch.FloatTensor(rollout['dones'])
-        old_values = torch.FloatTensor(rollout['values'])
-        old_log_probs = torch.FloatTensor(rollout['log_probs'])
+        states = torch.FloatTensor(rollout['states']).to(self.device)
+        actions = torch.FloatTensor(rollout['actions']).to(self.device)
+        rewards = torch.FloatTensor(rollout['rewards']).to(self.device)
+        dones = torch.FloatTensor(rollout['dones']).to(self.device)
+        old_values = torch.FloatTensor(rollout['values']).to(self.device)
+        old_log_probs = torch.FloatTensor(rollout['log_probs']).to(self.device)
         
         # Normalize states
         norm_states = self.adaptive_normalize(states, self.obs_mean, self.obs_var)
@@ -171,7 +350,7 @@ class AdvancedPPO:
         # Compute returns and advantages
         with torch.no_grad():
             # Get values from old policy
-            _, _, values, _ = self.old_policy(norm_states)
+            _, values, _ = self.old_policy(norm_states)
             # Compute GAE
             returns = self.compute_gae(rewards, values.squeeze(-1), dones)
             # Normalize returns
@@ -210,17 +389,16 @@ class AdvancedPPO:
                 b_old_log_probs = batch['old_log_probs']
                 
                 # Get current policy outputs
-                mu, std, value, value_std = self.policy(b_obs)
+                action_params, value, value_std = self.policy(b_obs)
                 
                 # Create normal distribution
-                dist = MultivariateNormal(mu, torch.diag_embed(std.pow(2)))
+                dist = AeonUtils.get_action_distribution(self.action_type, action_params)
                 
                 # Get log probabilities
                 log_probs = dist.log_prob(b_acts)
                 
                 # Calculate KL divergence
-                old_mu, old_std, _, _ = self.old_policy(b_obs)
-                old_dist = MultivariateNormal(old_mu, torch.diag_embed(old_std.pow(2)))
+                old_dist = AeonUtils.get_action_distribution(self.action_type, self.old_policy(b_obs)[0])
                 kl_div = torch.mean(torch.distributions.kl.kl_divergence(old_dist, dist))
                 
                 # Early stopping based on KL
@@ -291,6 +469,7 @@ class AdvancedPPO:
         # - Dynamic batch sizing
         # - Automated curriculum learning
         
+        # Resume from checkpoint if specified
         timesteps_so_far = 0
         episodes = 0
         best_reward = -float('inf')
@@ -315,6 +494,9 @@ class AdvancedPPO:
         success_rate_threshold = 0.8
         success_window = 10
         
+        # Enable AMP context manager if using mixed precision
+        amp_context = torch.cuda.amp.autocast if self.amp_settings.get("enabled", False) else nullcontext
+        
         # Main training loop
         while timesteps_so_far < total_timesteps:
             # Maybe adjust environment difficulty based on recent performance
@@ -337,29 +519,30 @@ class AdvancedPPO:
             while not done:
                 # Normalize state
                 norm_state = self.adaptive_normalize(
-                    torch.FloatTensor(state), 
+                    torch.FloatTensor(state).to(self.device), 
                     self.obs_mean, 
                     self.obs_var
                 )
                 
-                # Get action from policy
-                with torch.no_grad():
-                    mu, std, value, _ = self.policy(norm_state.unsqueeze(0))
+                # Get action from policy using mixed precision if enabled
+                with torch.no_grad(), amp_context():
+                    action_params, value, _ = self.policy(norm_state.unsqueeze(0))
                     
-                    # Create distribution
-                    dist = MultivariateNormal(mu, torch.diag_embed(std.pow(2)))
+                    # Create distribution using utility function
+                    dist = AeonUtils.get_action_distribution(self.action_type, action_params)
                     
                     # Sample action
                     action = dist.sample()
                     log_prob = dist.log_prob(action)
                     
                     # Clip action to environment bounds if needed
-                    clipped_action = action.squeeze(0).numpy()
-                    clipped_action = np.clip(
-                        clipped_action, 
-                        self.env.action_space.low, 
-                        self.env.action_space.high
-                    )
+                    clipped_action = action.squeeze(0).cpu().numpy()
+                    if self.action_type == 'continuous' or self.action_type == 'mixed':
+                        clipped_action = np.clip(
+                            clipped_action, 
+                            self.env.action_space.low, 
+                            self.env.action_space.high
+                        )
                 
                 # Step environment
                 next_state, reward, done, truncated, info = self.env.step(clipped_action)
@@ -387,12 +570,21 @@ class AdvancedPPO:
                     # Update policy
                     metrics = self.update(rollout_buffer)
                     
+                    # Store metrics for tracking
+                    for k, v in metrics.items():
+                        if k in self.training_stats:
+                            self.training_stats[k].append(v)
+                    
                     # Clear buffer
                     for k in rollout_buffer.keys():
                         rollout_buffer[k] = []
                 
                 # Move to next state
                 state = next_state
+                
+                # Checkpoint saving
+                if self.checkpoint_frequency > 0 and timesteps_so_far % (self.checkpoint_frequency * self.batch_size) == 0:
+                    self.save_checkpoint(timesteps_so_far)
                 
                 # Break if we've reached the total timesteps
                 if timesteps_so_far >= total_timesteps:
@@ -402,6 +594,11 @@ class AdvancedPPO:
             episodes += 1
             episode_rewards.append(episode_reward)
             episode_lengths.append(episode_length)
+            
+            # Update training stats
+            self.training_stats['rewards'].append(episode_reward)
+            self.training_stats['episode_lengths'].append(episode_length)
+            self.training_stats['learning_rates'].append(self.optimizer.param_groups[0]['lr'])
             
             # Track success for curriculum learning (example: success if reward > threshold)
             success = episode_reward > 100  # Adjust threshold based on your task
@@ -421,7 +618,12 @@ class AdvancedPPO:
             if episode_reward > best_reward:
                 best_reward = episode_reward
                 # Save best model
-                # torch.save(self.policy.state_dict(), "best_model.pt")
+                self.save_checkpoint(timesteps_so_far)
+            
+            # Learning rate scheduling if enabled
+            if self.lr_scheduler is not None and episodes % 10 == 0:
+                # Use average reward over last 10 episodes for scheduling
+                self.lr_scheduler.step(np.mean(episode_rewards[-10:]))
             
             # Print progress
             if episodes % 10 == 0:
@@ -429,14 +631,68 @@ class AdvancedPPO:
                 avg_length = np.mean(episode_lengths[-10:])
                 print(f"Episode {episodes}, Timesteps: {timesteps_so_far}")
                 print(f"Average reward: {avg_reward:.2f}, Average length: {avg_length:.1f}")
-                print(f"Current batch size: {self.batch_size}")
+                print(f"Current batch size: {self.batch_size}, LR: {self.optimizer.param_groups[0]['lr']:.2e}")
+                print(f"Clip range: {self.clip_range_scheduler.current_value:.3f}")
+                
+        # Final checkpoint
+        final_checkpoint = self.save_checkpoint(timesteps_so_far)
+        print(f"Training complete. Final checkpoint saved to {final_checkpoint}")
                 
         return {
             "episodes": episodes,
             "timesteps": timesteps_so_far,
             "best_reward": best_reward,
-            "final_avg_reward": np.mean(episode_rewards[-10:])
+            "final_avg_reward": np.mean(episode_rewards[-10:]),
+            "checkpoint_path": final_checkpoint,
+            "training_stats": self.training_stats
         }
+
+    # Add checkpoint methods
+    def save_checkpoint(self, timestep):
+        """Save training checkpoint"""
+        checkpoint_path = os.path.join(self.checkpoint_dir, f"checkpoint_{timestep}.pt")
+        AeonUtils.create_checkpoint(
+            model=self.policy,
+            optimizer=self.optimizer,
+            stats=self.training_stats,
+            path=checkpoint_path,
+            extra_data={
+                'timestep': timestep,
+                'obs_mean': self.obs_mean,
+                'obs_var': self.obs_var,
+                'return_mean': self.return_mean,
+                'return_var': self.return_var,
+                'clip_range': self.clip_range_scheduler.current_value
+            }
+        )
+        return checkpoint_path
+        
+    def load_checkpoint(self, path):
+        """Load training checkpoint"""
+        checkpoint = AeonUtils.load_checkpoint(
+            path=path,
+            model=self.policy,
+            optimizer=self.optimizer
+        )
+        
+        # Copy weights to old policy
+        self.old_policy.load_state_dict(self.policy.state_dict())
+        
+        # Restore normalization statistics
+        self.obs_mean = checkpoint.get('obs_mean', self.obs_mean)
+        self.obs_var = checkpoint.get('obs_var', self.obs_var)
+        self.return_mean = checkpoint.get('return_mean', self.return_mean)
+        self.return_var = checkpoint.get('return_var', self.return_var)
+        
+        # Restore adaptive clipper
+        self.clip_range_scheduler.current_value = checkpoint.get(
+            'clip_range', self.clip_range_scheduler.current_value
+        )
+        
+        # Restore stats
+        self.training_stats = checkpoint.get('stats', self.training_stats)
+        
+        return checkpoint.get('timestep', 0)
 
 class Lookahead:
     # Lookahead optimizer implementation
