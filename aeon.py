@@ -694,6 +694,66 @@ class AdvancedPPO:
         
         return checkpoint.get('timestep', 0)
 
+    def get_action(self, state, deterministic=False):
+        """
+        Get action from policy for a single state.
+        
+        Args:
+            state: Environment state (numpy array)
+            deterministic: If True, return deterministic action (mean)
+                           If False, sample from distribution (default)
+        
+        Returns:
+            action: Action to take in the environment (numpy array)
+        """
+        # Convert state to tensor and normalize
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).to(self.device)
+            norm_state = self.adaptive_normalize(
+                state_tensor,
+                self.obs_mean,
+                self.obs_var
+            )
+            
+            # Get policy distribution
+            action_params, _, _ = self.policy(norm_state.unsqueeze(0))
+            
+            # Get action based on action type and deterministic flag
+            if deterministic:
+                if self.action_type == 'continuous':
+                    action = action_params["mean"]
+                elif self.action_type == 'discrete':
+                    action = torch.argmax(action_params["logits"], dim=-1)
+                elif self.action_type == 'mixed':
+                    continuous_action = action_params["mean"]
+                    discrete_actions = [torch.argmax(logits, dim=-1) for logits in action_params["logits"]]
+                    action = torch.cat([continuous_action] + discrete_actions, dim=-1)
+            else:
+                # Sample from distribution
+                dist = AeonUtils.get_action_distribution(self.action_type, action_params)
+                if self.action_type == 'mixed':
+                    # Handle mixed action spaces
+                    continuous_dist, discrete_dist = dist
+                    continuous_action = continuous_dist.sample()
+                    discrete_action = discrete_dist.sample()
+                    action = torch.cat([continuous_action, discrete_action], dim=-1)
+                else:
+                    action = dist.sample()
+                
+            # Clip continuous actions to environment bounds if needed
+            if self.action_type == 'continuous' or self.action_type == 'mixed':
+                if hasattr(self.env.action_space, 'low') and hasattr(self.env.action_space, 'high'):
+                    action_np = action.squeeze(0).cpu().numpy()
+                    action_np = np.clip(
+                        action_np,
+                        self.env.action_space.low,
+                        self.env.action_space.high
+                    )
+                    return action_np
+            
+            # Return action as numpy array
+            return action.squeeze(0).cpu().numpy()
+
 class Lookahead:
     # Lookahead optimizer implementation
     def __init__(self, optimizer, k=5, alpha=0.5):
